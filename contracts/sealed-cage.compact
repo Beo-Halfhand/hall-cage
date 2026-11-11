@@ -1,0 +1,341 @@
+pragma language_version 0.23;
+
+import CompactStandardLibrary;
+
+// sealed-cage v4 (preprod, tNIGHT only). A deposit bank for Sealed Hand tables on tNIGHT.
+// Players deposit once, sit with a declared exposure (atRisk), and the judge settles rounds by moving
+// balances. NIGHT moves only on deposit and withdraw; settle moves no NIGHT, so it can be sponsored.
+// Identity: playerId = H(sk), as in sworn-escrow v0. The payout address is bound at first deposit.
+// Since cage #3: a seated player can't deposit, and a stand runs out after escapeSecs. A transaction fails if anything it read has
+// changed by the time it lands, so state is split to keep the ways out and the settles from reading what the other writes:
+//   tables: last round and heartbeat, written only by settles and a new epoch.  epochs: written only by a new epoch.
+//   seats: how many sit at a table. A Counter, so a settle sees "someone is here", not the number, and a sit doesn't disturb it.
+//   risks: what a seat can still lose, written by debits. seat: who sits where, which a debit doesn't touch, so it can't disturb a stand.
+// Seat authority: a deposit can carry a permit that lets one judge key seat its owner and move them between tables, with no wallet
+// prompt, up to `cap` a seat, until `until`, and never so that a loss could take the balance below `floor`, which is the balance at the grant
+// less cap. So cap is also the most a permit can lose, wins aside. The judge still can't withdraw and can't change the payout address.
+// A stand ends the permit. So does a revoke, which is a deposit of 0 with the empty permit: nobody else writes a permit, so nothing can keep it off the chain.
+// While a permit is live nobody can rescue that balance (F5), so a stranger can't send a granted player home between seats.
+// Since v4b there are 11 circuits, down from 14, so the locked deploy fits one transaction: a move is seatByJudge with a from-table, a revoke is a deposit,
+// and a single settle is a batch of one. A batch holds 4 entries, not 8, so that a small settle can land (see settleBatch).
+// A permit runs at most maxGrant past the block's clock when it is granted (L1), so F5's hold on a lost-key player's money ends at most that long
+// after the grant. A seat that binds still holds it, as before, until the judge releases it or its table goes quiet.
+
+export struct Line  { id: Bytes<32>; debit: Uint<64>; credit: Uint<64>; }
+export struct Entry { table: Uint<32>; roundNo: Uint<64>; houseCut: Uint<64>; lines: Vector<6, Maybe<Line>>; }
+export struct Table { lastRound: Uint<64>; heartbeat: Uint<64>; }
+export struct Seat  { table: Uint<32>; epoch: Uint<32>; standing: Boolean; standAt: Uint<64>; }
+export struct Permit { judge: Bytes<32>; cap: Uint<64>; until: Uint<64>; floor: Uint<64>; }
+
+export ledger judge: Bytes<32>;
+export ledger houseId: Bytes<32>;                       // rake is credited to this balance; the house withdraws like a player
+export ledger maxRake: Uint<64>;                        // per round, in STAR; 0 = no rake
+export ledger roundCap: Uint<64>;                       // largest single debit, in STAR
+// The longest a permit may run: seconds past the block's clock at the grant. Here and not after permits, so that no other field moves: the compiler
+// keeps the last 15 fields in a group of their own, so a 20th field at the end would push escapeSecs into the first group and renumber 14 fields.
+// Here, every other circuit compiles to the same zkir as before.
+export sealed ledger maxGrant: Uint<64>;
+export ledger escapeSecs: Uint<64>;                     // a table with no settle for this long is dead: its locks void
+export ledger maxSeats: Uint<8>;
+export ledger clockSlack: Uint<64>;                     // a declared `now` may lag block time by this much (seconds)
+export ledger judgeDelay: Uint<64>;                     // timelock on a judge change (seconds)
+export ledger pendingJudge: Bytes<32>;
+export ledger pendingAt: Uint<64>;
+export ledger hasPending: Boolean;
+export ledger balance: Map<Bytes<32>, Uint<64>>;
+export ledger payTo: Map<Bytes<32>, UserAddress>;
+export ledger seat: Map<Bytes<32>, Seat>;
+export ledger tables: Map<Uint<32>, Table>;
+export ledger epochs: Map<Uint<32>, Uint<32>>;           // a table's current epoch
+export ledger seats: Map<Uint<32>, Counter>;              // seats taken at a table's current epoch
+export ledger risks: Map<Bytes<32>, Uint<64>>;            // what a seat can still lose. Only read through a seat; a new sit overwrites it
+export ledger permits: Map<Bytes<32>, Permit>;            // who may seat this id, up to what, until when. Last, so the other circuits' state layout doesn't move
+
+witness secretKey(): Bytes<32>;
+
+export pure circuit playerId(sk: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "sealed-cage:player:v0"), sk]);
+}
+
+constructor(judgeId: Bytes<32>, house: Bytes<32>, rake: Uint<64>, cap: Uint<64>, escape: Uint<64>, seats: Uint<8>, slack: Uint<64>, rotateDelay: Uint<64>, grantSecs: Uint<64>) {
+  // In seconds. The ceiling is a guard against milliseconds: 30 days in milliseconds would be 82 years.
+  assert(disclose(grantSecs) > 0 && disclose(grantSecs) <= 31536000, "maxGrant must be from 1 second to 365 days");
+  assert(disclose(rotateDelay) >= (disclose(escape) + disclose(slack)) as Uint<64>, "judgeDelay must cover the escape window and the clock slack");
+  // A stand can be back-dated by the slack, so at or over the escape window a loser could stand and leave at once. At 0 no time check can pass.
+  assert(disclose(slack) > 0 && disclose(slack) < disclose(escape), "clockSlack must be above 0 and under the escape window");
+  assert(disclose(cap) > 0, "roundCap must be positive");
+  assert(disclose(escape) > 0, "escape must be positive");
+  assert(disclose(seats) >= 2, "need two seats");
+  judge = disclose(judgeId);
+  houseId = disclose(house);
+  maxRake = disclose(rake);
+  roundCap = disclose(cap);
+  escapeSecs = disclose(escape);
+  maxSeats = disclose(seats);
+  clockSlack = disclose(slack);
+  judgeDelay = disclose(rotateDelay);
+  hasPending = false;
+  maxGrant = disclose(grantSecs);
+}
+// Compact 0.23 can compare block time but not read it, so callers declare `now`: not in the future, not stale.
+circuit checkedNow(now: Uint<64>): Uint<64> {
+  const n = disclose(now);
+  assert(blockTimeGte(n), "declared time is in the future");
+  assert(blockTimeLt((n + clockSlack) as Uint<64>), "declared time is stale");
+  return n;
+}
+
+circuit me(): Bytes<32> { return disclose(playerId(secretKey())); }
+circuit bal(id: Bytes<32>): Uint<64> { return balance.member(id) ? balance.lookup(id) : 0; }
+circuit tableOf(t: Uint<32>): Table { return tables.member(t) ? tables.lookup(t) : Table { lastRound: 0, heartbeat: 0 }; }
+circuit epochOf(t: Uint<32>): Uint<32> { return epochs.member(t) ? epochs.lookup(t) : 0; }
+circuit occupied(t: Uint<32>): Boolean { return seats.member(t) && !seats.lookup(t).lessThan(1); }
+circuit alive(t: Uint<32>): Boolean { return occupied(t) && blockTimeLt((tableOf(t).heartbeat + escapeSecs) as Uint<64>); }
+// A standing seat has escapeSecs from its stand to be settled. After that it is free, whatever the table is doing.
+circuit standExpired(s: Seat): Boolean { return s.standing && blockTimeGte((s.standAt + escapeSecs) as Uint<64>); }
+// A seat binds only while its table is alive, the seat belongs to the table's current epoch, and its stand hasn't run out.
+// An expired stand answers first, and a stale epoch answers next, so neither reads what a settle writes.
+circuit bound(id: Bytes<32>): Boolean {
+  if (!seat.member(id)) return false;
+  const s = seat.lookup(id);
+  if (standExpired(s)) return false;
+  return s.epoch == epochOf(s.table) && alive(s.table);
+}
+// A void seat is cleared when its owner leaves. A standing seat stays: its owner's next sit or the
+// judge's release takes it off the table's count, so this exit writes nothing a settle could be reading.
+circuit clearIfNotStanding(id: Bytes<32>): [] {
+  if (seat.member(id) && !seat.lookup(id).standing) seat.remove(id);
+}
+
+// A seat that no longer binds comes off. If it is an expired stand at a live table, that table has one seat fewer.
+circuit clearOldSeat(id: Bytes<32>): [] {
+  if (seat.member(id)) {
+    const old = seat.lookup(id);
+    if (old.epoch == epochOf(old.table) && alive(old.table)) seats.lookup(old.table).decrement(1);
+    seat.remove(id);
+  }
+}
+
+circuit takeSeat(id: Bytes<32>, t: Uint<32>, r: Uint<64>, n: Uint<64>): [] {
+  risks.insert(id, r);
+  if (alive(t)) {
+    assert(seats.lookup(t).lessThan(maxSeats), "table is full");
+    seats.lookup(t).increment(1);
+    seat.insert(id, Seat { table: t, epoch: epochOf(t), standing: false, standAt: 0 });
+  } else {
+    // Dead or empty table: a new epoch voids every old seat; the clock starts now.
+    const ep = (epochOf(t) + 1) as Uint<32>;
+    epochs.insert(t, ep);
+    tables.insert(t, Table { lastRound: tableOf(t).lastRound, heartbeat: n });
+    seats.insert(t, default<Counter>);
+    seats.lookup(t).increment(1);
+    seat.insert(id, Seat { table: t, epoch: ep, standing: false, standAt: 0 });
+  }
+}
+
+// cap 0 is the empty permit: the money goes in, and any permit already here stays as it is, its floor raised by the same amount so a top-up adds nothing the judge can place.
+// Any other cap replaces the permit, with a new floor.
+// Amount 0 with the empty permit is a revoke: it ends the caller's permit and moves no money. Any seat they already have stays until it is settled,
+// released or stood from. It reads the caller's own permit and nothing else, not the seat, the balance or the table, so no settle, seat or move
+// can make it fail. A stand ends the permit too, so a revoke that lands after a stand fails with "no permit", which means it is already done.
+export circuit deposit(payout: UserAddress, amount: Uint<64>, judgeId: Bytes<32>, cap: Uint<64>, until: Uint<64>): [] {
+  const id = me();
+  const a = disclose(amount);
+  const c = disclose(cap);
+  if (a == 0 && c == 0) {
+    assert(permits.member(id), "no permit");
+    permits.remove(id);
+  } else {
+    const p = disclose(payout);
+    assert(a > 0, "amount must be positive");
+    // A settle reads each named seat's balance, so a seated loser's deposit would make the settle fail.
+    assert(!bound(id), "seated: deposit after you stand");
+    receiveUnshielded(nativeToken(), a as Uint<128>);
+    if (payTo.member(id)) assert(payTo.lookup(id) == p, "payout address is fixed at first deposit");
+    else payTo.insert(id, p);
+    const after = (bal(id) + a) as Uint<64>;
+    balance.insert(id, after);
+    // L1: until <= now + maxGrant, by the block's clock. Block time only goes up, so a grant that passes when built passes when it lands, unless the
+    // builder's clock was ahead of the chain's. The first test keeps the subtraction from going below 0, and an until that small has passed anyway.
+    if (c > 0) assert(disclose(until) <= maxGrant || blockTimeGte((disclose(until) - maxGrant) as Uint<64>), "a permit runs at most maxGrant");
+    if (c > 0) permits.insert(id, Permit { judge: disclose(judgeId), cap: c, until: disclose(until), floor: after > c ? (after - c) as Uint<64> : 0 as Uint<64> });
+    else if (permits.member(id)) { const p0 = permits.lookup(id); permits.insert(id, Permit { judge: p0.judge, cap: p0.cap, until: p0.until, floor: (p0.floor + a) as Uint<64> }); }
+  }
+}
+
+export circuit sit(tableId: Uint<32>, atRisk: Uint<64>, now: Uint<64>): [] {
+  const id = me();
+  const n = checkedNow(now);
+  const r = disclose(atRisk);
+  assert(r > 0, "atRisk must be positive");
+  assert(r <= bal(id), "atRisk exceeds balance");
+  assert(!bound(id), "already seated");
+  clearOldSeat(id);
+  takeSeat(id, disclose(tableId), r, n);
+}
+
+// Intent only. The next settle naming this seat releases it, and if none comes within escapeSecs it is free anyway.
+// The contract cannot see whether a round is live, so an immediate release would let a loser leave between the deal and the settle.
+// It reads this seat and not the table: a settle naming other players can't make it fail. On a void seat it changes nothing that matters.
+export circuit stand(tableId: Uint<32>, now: Uint<64>): [] {
+  const id = me();
+  const n = checkedNow(now);
+  assert(seat.member(id), "not seated");
+  const s = seat.lookup(id);
+  assert(s.table == disclose(tableId), "seated at another table");
+  assert(!s.standing, "already standing");
+  seat.insert(id, Seat { table: s.table, epoch: s.epoch, standing: true, standAt: n });
+  if (permits.member(id)) permits.remove(id); // asking to leave ends the judge's authority: nothing can seat them again unless they grant it again
+}
+
+export circuit withdraw(amount: Uint<64>): [] {
+  const id = me();
+  assert(!bound(id), "seated: stand first, or wait for the table to go quiet");
+  clearIfNotStanding(id);
+  assert(payTo.member(id), "no payout address: deposit once first");
+  const a = disclose(amount);
+  assert(a > 0, "amount must be positive");
+  assert(a <= bal(id), "insufficient balance");
+  balance.insert(id, (bal(id) - a) as Uint<64>);
+  sendUnshielded(nativeToken(), a as Uint<128>, right<ContractAddress, UserAddress>(payTo.lookup(id)));
+}
+
+// Anyone may call. The whole balance goes to the bound payout address; the key is not needed (lost-key path).
+// Not while a permit is live (F5): a stranger could otherwise send a granted player home in any gap between seats, again and again, and the
+// permit's floor would stay where it was, so the player would have to grant again. Live means there, and `until` not passed by the block's clock: the time
+// test a seat by the judge uses. A permit naming another key counts too, until it runs out. So a lost-key player waits for `until`. Only the player
+// writes a permit, so the judge can't use this to hold money in. A grant's `until` is at most maxGrant past the block's clock (deposit), so F5 holds a balance
+// at most that long after the latest grant. A seat that binds holds it as before: a judge key that seats a lost-key player and keeps their table alive holds
+// them for as long as it does that. The honest judge releases them.
+export circuit rescue(id: Bytes<32>): [] {
+  const who = disclose(id);
+  assert(!(permits.member(who) && blockTimeLte(permits.lookup(who).until)), "a permit is live: rescue after it runs out");
+  assert(!bound(who), "seated: the judge must release this seat first");
+  clearIfNotStanding(who);
+  assert(payTo.member(who), "no payout address");
+  const a = bal(who);
+  assert(a > 0, "nothing to rescue");
+  balance.insert(who, 0);
+  sendUnshielded(nativeToken(), a as Uint<128>, right<ContractAddress, UserAddress>(payTo.lookup(who)));
+}
+
+// Judge rotation: propose, wait judgeDelay, the NEW key accepts. The old key can cancel while pending.
+export circuit proposeJudge(newId: Bytes<32>, now: Uint<64>): [] {
+  assert(me() == judge, "judge only");
+  const n = checkedNow(now);
+  const j = disclose(newId);
+  assert(j != judge, "already the judge");
+  pendingJudge = j;
+  pendingAt = n;
+  hasPending = true;
+}
+
+export circuit cancelJudge(): [] {
+  assert(me() == judge, "judge only");
+  assert(hasPending, "no pending judge");
+  hasPending = false;
+}
+
+export circuit acceptJudge(): [] {
+  assert(hasPending, "no pending judge");
+  assert(me() == pendingJudge, "only the proposed judge may accept");
+  assert(blockTimeGte((pendingAt + judgeDelay) as Uint<64>), "timelock has not passed");
+  judge = pendingJudge;
+  hasPending = false;
+}
+
+// Judge-only. Frees a seat outside a settle (no round live, or a player who lost their key).
+export circuit release(tableId: Uint<32>, id: Bytes<32>): [] {
+  assert(me() == judge, "judge only");
+  const t = disclose(tableId);
+  const who = disclose(id);
+  assert(seat.member(who), "no seat");
+  const s = seat.lookup(who);
+  assert(s.table == t, "not at this table");
+  seat.remove(who);
+  if (s.epoch == epochOf(t) && occupied(t)) seats.lookup(t).decrement(1);
+}
+
+// What a seat and a move by the judge both need. The permit's time is checked against the block, not the declared `now`, which can lag by the slack.
+circuit checkPermit(who: Bytes<32>, r: Uint<64>): [] {
+  assert(me() == judge, "judge only");
+  assert(permits.member(who), "no permit");
+  const p = permits.lookup(who);
+  assert(p.judge == judge, "the permit names another judge");
+  assert(blockTimeLte(p.until), "the permit has run out");
+  assert(r > 0, "atRisk must be positive");
+  assert(r <= p.cap, "atRisk over the permit's cap");
+  assert(r <= bal(who), "atRisk exceeds balance");
+  assert(((r + p.floor) as Uint<65>) <= bal(who), "atRisk would reach below the permit's floor");
+}
+
+// Judge-only, under the player's permit. Two moves in one circuit, so the deploy carries one verifier key for both:
+// - `fromTable` none, a seat: the player has no seat that binds. Writes the seat exactly as sit does. A standing seat is refused, expired or not. A player can
+//   only get here with a new grant after their stand ran out, and such a seat may still be on its table's count, which only their own sit or the judge's
+//   release takes off. Any other seat that gets past these checks is void and on no count, so the new one just overwrites it.
+// - `fromTable` some table, a move: releases that table and seats at `tableId` in one transaction, so the balance is never held twice or not at all. The seat must be
+//   at `fromTable`, and a standing seat is refused: moving it would wipe the stand and the deadline that comes with it. The new seat's atRisk is the one given here.
+//   The contract can't see whether a round is live at `fromTable`, so the judge must have settled it first, as it must for a release.
+export circuit seatByJudge(id: Bytes<32>, fromTable: Maybe<Uint<32>>, tableId: Uint<32>, atRisk: Uint<64>, now: Uint<64>): [] {
+  const who = disclose(id);
+  const t = disclose(tableId);
+  const n = checkedNow(now);
+  const r = disclose(atRisk);
+  checkPermit(who, r);
+  const fm = disclose(fromTable);
+  if (fm.is_some) {
+    const f = fm.value;
+    assert(f != t, "a move goes to another table");
+    assert(seat.member(who), "no seat");
+    const s = seat.lookup(who);
+    assert(s.table == f, "not at this table");
+    assert(!s.standing, "standing: this seat is leaving");
+    seat.remove(who);
+    if (s.epoch == epochOf(f) && occupied(f)) seats.lookup(f).decrement(1);
+  } else {
+    assert(!bound(who), "already seated");
+    assert(!(seat.member(who) && seat.lookup(who).standing), "standing: this seat is leaving");
+  }
+  takeSeat(who, t, r, n);
+}
+
+circuit settleOne(e: Entry, n: Uint<64>): [] {
+  const t = disclose(e.table);
+  const tb = tableOf(t);
+  const ep = epochOf(t);
+  assert(alive(t), "table is dead or empty: nothing to settle");
+  assert(disclose(e.roundNo) == tb.lastRound + 1, "round number out of order");
+  assert(disclose(e.houseCut) <= maxRake, "rake too large");
+  const debits = fold((acc, l) => (acc + (l.is_some ? l.value.debit : 0)) as Uint<64>, 0 as Uint<64>, e.lines);
+  const credits = fold((acc, l) => (acc + (l.is_some ? l.value.credit : 0)) as Uint<64>, 0 as Uint<64>, e.lines);
+  assert(disclose(debits) == disclose(credits) + disclose(e.houseCut), "debits must equal credits plus rake");
+  for (const l of e.lines) if (l.is_some) settleLine(t, ep, l.value);
+  if (disclose(e.houseCut) > 0) balance.insert(houseId, (bal(houseId) + e.houseCut) as Uint<64>);
+  tables.insert(t, Table { lastRound: (tb.lastRound + 1) as Uint<64>, heartbeat: n });
+}
+
+circuit settleLine(t: Uint<32>, epoch: Uint<32>, l: Line): [] {
+  const id = disclose(l.id);
+  assert(seat.member(id), "line names a player with no seat");
+  const s = seat.lookup(id);
+  assert(s.table == t && s.epoch == epoch, "line names a player not sitting at this table");
+  assert(!standExpired(s), "this seat's stand has run out");
+  assert(disclose(l.debit) == 0 || disclose(l.credit) == 0, "a line is a debit or a credit, not both");
+  assert(disclose(l.debit) <= roundCap, "debit over roundCap");
+  const risk = risks.member(id) ? risks.lookup(id) : 0;
+  assert(disclose(l.debit) <= risk, "debit over the player's remaining atRisk");
+  assert(disclose(l.debit) <= bal(id), "debit over balance");
+  balance.insert(id, ((bal(id) - l.debit) + l.credit) as Uint<64>);
+  if (s.standing) { seat.remove(id); seats.lookup(t).decrement(1); }
+  else if (disclose(l.debit) > 0) risks.insert(id, (risk - l.debit) as Uint<64>);
+}
+
+// Up to 4 entries, at one table or several. A single round is a batch of one: v4b dropped settleRound, which did only that, to keep the deploy in one transaction.
+// Why 4: the proof declares a public input for every ledger operation every slot could make (257 a line, 287 an entry, 55 fixed), used or not, and preprod
+// lets a transaction take at most 2 µs a byte (15 ms at least) to dismiss, at about 1.14 µs a public input. 8 entries (14,687 inputs, 25.2 ms) refused any
+// settle under 12,594 bytes, which is a settle of one and most two-player rounds. 4 entries is 7,371 inputs, about 16.9 ms, and the smallest settle is about 12,300 bytes.
+export circuit settleBatch(es: Vector<4, Maybe<Entry>>, now: Uint<64>): [] {
+  assert(me() == judge, "judge only");
+  const n = checkedNow(now);
+  for (const e of disclose(es)) if (e.is_some) settleOne(e.value, n);
+}

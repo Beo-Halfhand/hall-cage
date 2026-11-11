@@ -1,0 +1,19 @@
+node_modules
+contracts/managed/
+.wallets
+.judge/
+deployment.*.json
+!deployment.public.json
+logs/
+*.log
+*.bak
+.env*
+midnight-level-db/
+.claude/
+build/
+
+# Ledger 9 port (11-09): the deployed 0.31.1 cage build, copied from sealed-cage-v4b-wire/contracts/managed/sealed-cage (45 MB of keys; never recompiled)
+packages/cage-l8/sealed-cage/
+.wallets/
+packages/cage-l8/dice-proof/
+.dice-state/

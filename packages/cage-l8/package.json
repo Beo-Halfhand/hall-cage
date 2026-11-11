@@ -1,0 +1,16 @@
+{
+  "name": "cage-l8",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "The pre-fork builds from compactc 0.31.1 (runtime 0.16.0), kept as deployed: cage4 (.) and dice-proof (./dice-proof), ledger 8 contracts that Midnight.js 5 calls after the fork. Never recompile them; their verifier keys are the ones on chain.",
+  "exports": {
+    ".": "./sealed-cage/contract/index.js",
+    "./dice-proof": "./dice-proof/contract/index.js",
+    "./runtime": "./runtime.js",
+    "./package.json": "./package.json"
+  },
+  "dependencies": {
+    "@midnight-ntwrk/compact-runtime": "0.16.0"
+  }
+}

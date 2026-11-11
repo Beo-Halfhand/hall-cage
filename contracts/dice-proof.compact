@@ -1,0 +1,366 @@
+pragma language_version 0.23;
+
+import CompactStandardLibrary;
+
+// dice-proof v0 (preprod, no money in it). Cup & Claim's dice, checked on chain.
+//
+// A round, in the order the chain enforces:
+//   1. openRound   The house seals its seed, and seals the cup of every house-run seat. Each player's seat is named, with the hash of the
+//                  seal that player will post: the player's page sends that hash before this. Nobody can see through it, and nobody can
+//                  change a seal once it's here. So no seat, whoever holds it, can try seeds until the dice suit it, because the last thing
+//                  mixed into the dice is fixed before anyone's seal can be read.
+//   2. commitCup   Each player posts that seal, from their own key. The house can't know the seed behind it, and nobody has seen the house seed yet.
+//   3. openHouse   The house opens its seed. It must be the one sealed in step 1. The chain mixes it with every sealed cup into the
+//                  round's salt. From here each cup is fixed: H(salt, that cup's seed, seat). Only a cup's owner can compute it.
+//   4. callLiar    The house posts the bid that was called, within a fixed time. Bidding itself is off chain. See docs/DICE-PROOF.md.
+//   5. proveCount  A cup answers: the proof shows this count comes from the sealed seed, with 1s wild. The dice stay private.
+//      showCup     Or a cup lifts: the dice go on chain, with the same proof that they are the sealed ones.
+//                  House-run seats answer first, so the house can't go quiet after seeing a player's count.
+//   6. finish      Anyone. The chain adds the counts and says whether the bid holds.
+//
+// A cup nobody answers for: see finish(). The windows are fixed at deployment, so the house can't shorten them for one round.
+// A round that ends with no call needs nothing proven, and no cup is ever opened. Once its time for a call has passed anyone can close it.
+
+export enum Phase { none, sealing, dealt, called, finished, voided }
+export enum Verdict { none, holds, falls, voided }
+export enum Why { none, counted, bidderSilent, callerSilent, bothSilent, thirdSilent, houseSilent, tooFewCups, houseSeatSilent, noCall }
+export enum SeatKind { empty, house, player }
+
+export struct RoundId { table: Uint<32>; round: Uint<32>; }
+export struct CupId { table: Uint<32>; round: Uint<32>; seat: Uint<8>; }
+// A house seat's `seal` is its seal. A player seat's is the hash of the seal it will post.
+export struct SeatInit { kind: SeatKind; holder: Bytes<32>; seal: Bytes<32>; }
+export struct Holder { key: Bytes<32>; preseal: Bytes<32>; }
+export struct Round {
+  phase: Phase;
+  houseCommit: Bytes<32>;
+  houseSeed: Bytes<32>;   // zero until opened
+  salt: Bytes<32>;        // zero until opened
+  sealBy: Uint<64>;       // players seal their cups before this
+  openBy: Uint<64>;       // the house opens its seed before this
+  houseSeats: Uint<8>;
+  playerSeats: Uint<8>;
+  dealt: Uint<8>;         // cups in play, set when the seed opens
+  callBy: Uint<64>;       // a call has to land before this. Fixed when the round opens, from the same windows, so nobody can move it later.
+  bidder: Uint<8>;
+  caller: Uint<8>;
+  bidCount: Uint<8>;
+  bidFace: Uint<8>;
+  houseBy: Uint<64>;      // house-run seats answer before this
+  answerBy: Uint<64>;     // every seat answers before this
+}
+export struct Answer { count: Uint<8>; shown: Boolean; dice: Vector<5, Uint<8>>; }
+export struct Result { verdict: Verdict; why: Why; total: Uint<8>; answered: Uint<8>; }
+
+export sealed ledger house: Bytes<32>;       // H(the house key). Sealed: there is no way to change it.
+export sealed ledger sealSecs: Uint<64>;     // how long players have to seal their cups
+export sealed ledger openSecs: Uint<64>;     // how long after that the house has to open its seed
+export sealed ledger callSecs: Uint<64>;     // how long past the house's last moment to open its seed the bidding has to reach a call
+export sealed ledger houseSecs: Uint<64>;    // how long house-run seats have to answer a call
+export sealed ledger answerSecs: Uint<64>;   // how long after that the players have to answer
+export sealed ledger clockSlack: Uint<64>;   // how far a declared `now` may lag block time
+
+export ledger rounds: Map<RoundId, Round>;
+export ledger holders: Map<CupId, Holder>;      // player seats: H(the seat's key), and the hash of the seal it will post
+export ledger houseRun: Set<CupId>;             // house-run seats
+export ledger commits: Map<CupId, Bytes<32>>;   // sealed cups. Written once.
+export ledger answers: Map<CupId, Answer>;      // written once
+export ledger results: Map<RoundId, Result>;
+// Counters, so seats answering in the same block don't invalidate each other's transaction: an increment reads nothing.
+export ledger playersIn: Map<RoundId, Counter>;
+export ledger answered: Map<RoundId, Counter>;
+export ledger houseAnswered: Map<RoundId, Counter>;
+export ledger totals: Map<RoundId, Counter>;
+export ledger houseFaults: Counter;             // rounds voided because the house never opened its seed
+
+witness seatKey(): Bytes<32>;
+witness cupSeed(cup: CupId): Bytes<32>;
+
+// ---------- the arithmetic. Pure, so anyone can run the same code off chain. persistentHash is SHA-256 of the fields in order. ----------
+
+export pure circuit keyId(sk: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "cup-and-claim:seat:v2"), sk]);
+}
+export pure circuit houseCommitOf(seed: Bytes<32>, id: RoundId): Bytes<32> {
+  return persistentHash<[Bytes<32>, Bytes<32>, RoundId]>([pad(32, "cup-and-claim:house:v2"), seed, id]);
+}
+// A seal is tied to this contract, so one a player posts on any other deployment says nothing about their seal here.
+export pure circuit commitOf(seed: Bytes<32>, cup: CupId, self: Bytes<32>): Bytes<32> {
+  return persistentHash<[Bytes<32>, Bytes<32>, CupId, Bytes<32>]>([pad(32, "cup-and-claim:commit:v2"), seed, cup, self]);
+}
+export pure circuit preSealOf(commit: Bytes<32>, cup: CupId): Bytes<32> {
+  return persistentHash<[Bytes<32>, Bytes<32>, CupId]>([pad(32, "cup-and-claim:preseal:v2"), commit, cup]);
+}
+export pure circuit saltOf(houseSeed: Bytes<32>, id: RoundId, cups: Vector<6, Bytes<32>>, self: Bytes<32>): Bytes<32> {
+  return persistentHash<[Bytes<32>, Bytes<32>, RoundId, Vector<6, Bytes<32>>, Bytes<32>]>([pad(32, "cup-and-claim:salt:v2"), houseSeed, id, cups, self]);
+}
+export pure circuit rollOf(salt: Bytes<32>, seed: Bytes<32>, seat: Uint<8>): Bytes<32> {
+  return persistentHash<[Bytes<32>, Bytes<32>, Bytes<32>, Uint<8>]>([pad(32, "cup-and-claim:roll:v2"), salt, seed, seat]);
+}
+// Two hash bytes make a word, and six ranges make a die. Each range holds 10,922 or 10,923 of the 65,536 words, so no face is off by
+// more than 1 part in 16,384.
+export pure circuit dieOf(hi: Uint<8>, lo: Uint<8>): Uint<8> {
+  const w = (hi * 256 + lo) as Uint<16>;
+  const a = (w >= 10923 ? 1 : 0) as Uint<8>;
+  const b = (w >= 21846 ? 1 : 0) as Uint<8>;
+  const c = (w >= 32768 ? 1 : 0) as Uint<8>;
+  const d = (w >= 43691 ? 1 : 0) as Uint<8>;
+  const e = (w >= 54614 ? 1 : 0) as Uint<8>;
+  return (1 + a + b + c + d + e) as Uint<8>;
+}
+export pure circuit diceOf(roll: Bytes<32>): Vector<5, Uint<8>> {
+  return [dieOf(roll[0], roll[1]), dieOf(roll[2], roll[3]), dieOf(roll[4], roll[5]), dieOf(roll[6], roll[7]), dieOf(roll[8], roll[9])];
+}
+// 1s are wild: they count for every face. Bids name faces 2 to 6, so a wild is never counted twice.
+export pure circuit countOf(dice: Vector<5, Uint<8>>, face: Uint<8>): Uint<8> {
+  return fold((n, d) => (n + ((d == face || d == 1) ? 1 : 0)) as Uint<8>, 0 as Uint<8>, dice);
+}
+
+// The windows are what the rules about silence stand on, and the deployer is the house. So these limits are in the contract, for anyone to read.
+constructor(houseId: Bytes<32>, seal: Uint<64>, open: Uint<64>, call: Uint<64>, houseAnswer: Uint<64>, playerAnswer: Uint<64>, slack: Uint<64>) {
+  assert(disclose(slack) >= 30 && disclose(slack) <= 300, "the clock slack must be 30 s to 5 min");
+  assert(disclose(seal) >= 120 && disclose(seal) <= 3600, "the seal window must be 2 min to 1 h");
+  assert(disclose(open) >= 60 && disclose(open) <= 3600, "the open window must be 1 min to 1 h");
+  assert(disclose(call) >= 300 && disclose(call) <= 14400, "the call window must be 5 min to 4 h");
+  assert(disclose(houseAnswer) >= disclose(slack) + 60 && disclose(houseAnswer) <= 3600, "the house's answer window must outlast the clock slack by 1 min, up to 1 h");
+  assert(disclose(playerAnswer) >= 120 && disclose(playerAnswer) <= 3600, "the players' answer window must be 2 min to 1 h");
+  house = disclose(houseId);
+  sealSecs = disclose(seal);
+  openSecs = disclose(open);
+  callSecs = disclose(call);
+  houseSecs = disclose(houseAnswer);
+  answerSecs = disclose(playerAnswer);
+  clockSlack = disclose(slack);
+}
+
+// ---------- helpers ----------
+
+// Compact 0.23 can compare block time but not read it, so the house declares `now`: not in the future, and not stale.
+circuit checkedNow(now: Uint<64>): Uint<64> {
+  const n = disclose(now);
+  assert(blockTimeGte(n), "declared time is in the future");
+  assert(blockTimeLt((n + clockSlack) as Uint<64>), "declared time is stale");
+  return n;
+}
+circuit houseOnly(): [] {
+  assert(disclose(keyId(seatKey()) == house), "house only");
+}
+circuit roundOf(id: RoundId): Round {
+  assert(rounds.member(id), "no such round");
+  return rounds.lookup(id);
+}
+pure circuit roundIdOf(cup: CupId): RoundId {
+  return RoundId { table: cup.table, round: cup.round };
+}
+pure circuit cupAt(id: RoundId, seat: Uint<8>): CupId {
+  return CupId { table: id.table, round: id.round, seat: seat };
+}
+circuit setSeat(id: RoundId, seat: Uint<8>, init: SeatInit): [] {
+  const cup = cupAt(id, seat);
+  if (init.kind == SeatKind.house) {
+    assert(init.seal != default<Bytes<32>>, "a house seat is sealed when the round opens");
+    commits.insert(cup, init.seal);
+    houseRun.insert(cup);
+  } else if (init.kind == SeatKind.player) {
+    assert(init.holder != default<Bytes<32>> && init.seal != default<Bytes<32>>, "a player seat names its holder and the hash of its seal");
+    holders.insert(cup, Holder { key: init.holder, preseal: init.seal });
+  }
+}
+pure circuit seatCount(seats: Vector<6, SeatInit>, kind: SeatKind): Uint<8> {
+  return fold((n, s) => (n + (s.kind == kind ? 1 : 0)) as Uint<8>, 0 as Uint<8>, seats);
+}
+circuit sealedAt(id: RoundId, seat: Uint<8>): Bytes<32> {
+  const cup = cupAt(id, seat);
+  return commits.member(cup) ? commits.lookup(cup) : default<Bytes<32>>;
+}
+// May this cup answer now? House-run seats go first, in their own window. Then the players.
+circuit answerable(cup: CupId): Round {
+  const id = roundIdOf(cup);
+  const r = roundOf(id);
+  assert(r.phase == Phase.called, "no call to answer");
+  assert(commits.member(cup), "no cup at this seat");
+  assert(!answers.member(cup), "this cup has already answered");
+  assert(blockTimeLt(r.answerBy), "too late: the answer window has closed");
+  if (houseRun.member(cup)) assert(blockTimeLt(r.houseBy), "too late: the house's answer window has closed");
+  else assert(houseAnswered.lookup(id).read() == r.houseSeats || blockTimeGte(r.houseBy), "the house's seats answer first");
+  return r;
+}
+// The one place a private seed enters: it must be the sealed one, and the dice come from it and the round's salt.
+circuit rollCup(cup: CupId, r: Round): Vector<5, Uint<8>> {
+  const seed = cupSeed(cup);
+  assert(disclose(commitOf(seed, cup, kernel.self().bytes) == commits.lookup(cup)), "this is not the seed sealed for this cup");
+  return diceOf(rollOf(r.salt, seed, cup.seat));
+}
+circuit record(cup: CupId, a: Answer): [] {
+  const id = roundIdOf(cup);
+  answers.insert(cup, a);
+  answered.lookup(id).increment(1);
+  totals.lookup(id).increment(a.count as Uint<16>);
+  if (houseRun.member(cup)) houseAnswered.lookup(id).increment(1);
+}
+circuit close(id: RoundId, r: Round, phase: Phase, verdict: Verdict, why: Why): [] {
+  rounds.insert(id, Round { ...r, phase: phase });
+  results.insert(id, Result { verdict: verdict, why: why, total: totals.lookup(id).read() as Uint<8>, answered: answered.lookup(id).read() as Uint<8> });
+}
+
+// ---------- the round ----------
+
+export circuit openRound(id: RoundId, houseCommit: Bytes<32>, seats: Vector<6, SeatInit>, now: Uint<64>): [] {
+  houseOnly();
+  const i = disclose(id);
+  const hc = disclose(houseCommit);
+  const s = disclose(seats);
+  const n = checkedNow(now);
+  assert(!rounds.member(i), "this round has already been opened");
+  assert(hc != default<Bytes<32>>, "the house must seal a seed");
+  const hs = seatCount(s, SeatKind.house);
+  const ps = seatCount(s, SeatKind.player);
+  assert(ps >= 1, "a round needs a player: with none, every seed would be the house's");
+  assert(hs + ps >= 2, "a round needs two seats");
+  setSeat(i, 0, s[0]);
+  setSeat(i, 1, s[1]);
+  setSeat(i, 2, s[2]);
+  setSeat(i, 3, s[3]);
+  setSeat(i, 4, s[4]);
+  setSeat(i, 5, s[5]);
+  playersIn.insert(i, default<Counter>);
+  answered.insert(i, default<Counter>);
+  houseAnswered.insert(i, default<Counter>);
+  totals.insert(i, default<Counter>);
+  // `n` may lag block time by up to the slack. The slack is added here so that can't eat into the players' window.
+  const sealBy = (n + clockSlack + sealSecs) as Uint<64>;
+  const openBy = (sealBy + openSecs) as Uint<64>;
+  rounds.insert(i, Round {
+    phase: Phase.sealing, houseCommit: hc, houseSeed: default<Bytes<32>>, salt: default<Bytes<32>>,
+    sealBy: sealBy, openBy: openBy, houseSeats: hs, playerSeats: ps, dealt: 0, callBy: (openBy + callSecs) as Uint<64>,
+    bidder: 0, caller: 0, bidCount: 0, bidFace: 0, houseBy: 0, answerBy: 0
+  });
+}
+
+export circuit commitCup(cup: CupId, commit: Bytes<32>): [] {
+  const c = disclose(cup);
+  const seal = disclose(commit);
+  const id = roundIdOf(c);
+  const r = roundOf(id);
+  assert(r.phase == Phase.sealing, "the deal has closed");
+  assert(blockTimeLt(r.sealBy), "too late to seal this cup");
+  assert(holders.member(c), "no player seat here");
+  const h = holders.lookup(c);
+  assert(disclose(keyId(seatKey()) == h.key), "this seat belongs to someone else");
+  assert(!commits.member(c), "this cup is already sealed");
+  assert(seal != default<Bytes<32>>, "a cup must be sealed with a commitment");
+  assert(preSealOf(seal, c) == h.preseal, "this is not the seal named when the round opened");
+  commits.insert(c, seal);
+  playersIn.lookup(id).increment(1);
+}
+
+// No key is needed: only the house knows the seed that opens its seal.
+export circuit openHouse(id: RoundId, houseSeed: Bytes<32>): [] {
+  const i = disclose(id);
+  const seed = disclose(houseSeed);
+  const r = roundOf(i);
+  assert(r.phase == Phase.sealing, "this round is not waiting to open");
+  assert(blockTimeLt(r.openBy), "too late: the house missed its window, and the round can be voided");
+  assert(houseCommitOf(seed, i) == r.houseCommit, "this is not the seed the house sealed");
+  const inn = playersIn.lookup(i).read();
+  assert(inn == r.playerSeats || blockTimeGte(r.sealBy), "players can still seal their cups");
+  const dealt = (r.houseSeats + inn) as Uint<8>;
+  if (inn == 0 || dealt < 2) {
+    close(i, r, Phase.voided, Verdict.voided, Why.tooFewCups);
+  } else {
+    const salt = saltOf(seed, i, [sealedAt(i, 0), sealedAt(i, 1), sealedAt(i, 2), sealedAt(i, 3), sealedAt(i, 4), sealedAt(i, 5)], kernel.self().bytes);
+    rounds.insert(i, Round { ...r, phase: Phase.dealt, houseSeed: seed, salt: salt, dealt: dealt });
+  }
+}
+
+// Anyone. Two cases, each once its time has passed:
+//   - The house never opened its seed. It could have worked out its own bots' dice from the seals by then, and this is the one choice it keeps:
+//     to open, or not. No player has lost a die or a bid, and it counts against the house here for anyone to read. Charging for it needs the cage.
+//   - A round with no call. That's a round everyone folded out of, or one the house sat on: from outside they look the same, so it isn't counted.
+//     No call can land after this, so a seat can't be caught out by a call posted long after it left. It also means the house can sit on a call
+//     it would lose, and the round voids. Bidding is off chain, so the chain can't tell. See docs/DICE-PROOF.md.
+export circuit voidRound(id: RoundId): [] {
+  const i = disclose(id);
+  const r = roundOf(i);
+  if (r.phase == Phase.sealing) {
+    assert(blockTimeGte(r.openBy), "the house still has time to open");
+    close(i, r, Phase.voided, Verdict.voided, Why.houseSilent);
+    houseFaults.increment(1);
+  } else {
+    assert(r.phase == Phase.dealt, "this round can't be voided");
+    assert(blockTimeGte(r.callBy), "this round still has time for a call");
+    close(i, r, Phase.voided, Verdict.voided, Why.noCall);
+  }
+}
+
+export circuit callLiar(id: RoundId, bidder: Uint<8>, caller: Uint<8>, count: Uint<8>, face: Uint<8>, now: Uint<64>): [] {
+  houseOnly();
+  const i = disclose(id);
+  const b = disclose(bidder);
+  const c = disclose(caller);
+  const k = disclose(count);
+  const f = disclose(face);
+  const n = checkedNow(now);
+  const r = roundOf(i);
+  assert(r.phase == Phase.dealt, "this round has no open bidding");
+  assert(blockTimeLt(r.callBy), "too late: the time for a call has passed");
+  assert(f >= 2 && f <= 6, "a bid names a face from 2 to 6");
+  assert(k >= 1 && k <= r.dealt * 5, "a bid names between 1 die and every die on the table");
+  assert(b != c, "a seat can't call its own bid");
+  assert(commits.member(cupAt(i, b)), "the bidder has no cup");
+  assert(commits.member(cupAt(i, c)), "the caller has no cup");
+  const houseBy = (n + houseSecs) as Uint<64>;
+  rounds.insert(i, Round { ...r, phase: Phase.called, bidder: b, caller: c, bidCount: k, bidFace: f, houseBy: houseBy, answerBy: (houseBy + answerSecs) as Uint<64> });
+}
+
+// The cup stays shut. `claimed` is the count this seat says it holds of the called face. The circuit works the count out from the
+// sealed seed and refuses anything else, and only the count goes out.
+export circuit proveCount(cup: CupId, claimed: Uint<8>): [] {
+  const c = disclose(cup);
+  const n = disclose(claimed);
+  const r = answerable(c);
+  assert(disclose(countOf(rollCup(c, r), r.bidFace) == n), "that is not this cup's count");
+  record(c, Answer { count: n, shown: false, dice: default<Vector<5, Uint<8>>> });
+}
+
+// The cup lifts: the seat chooses to put its dice on chain. The proof is the same, so the dice can't be any others.
+export circuit showCup(cup: CupId, dice: Vector<5, Uint<8>>): [] {
+  const c = disclose(cup);
+  const shown = disclose(dice);
+  const r = answerable(c);
+  assert(disclose(rollCup(c, r) == shown), "those are not this cup's dice");
+  record(c, Answer { count: countOf(shown, r.bidFace), shown: true, dice: shown });
+}
+
+// Anyone. The chain adds up what was proven.
+//   - What's proven already settles it: the bid holds, or even five of a kind from every silent cup couldn't save it. No need to wait.
+//   - Otherwise, once the window has closed, silence loses. A bidder or caller who didn't answer loses the call.
+//   - If they both answered and a third cup is what's missing, a silent house-run seat loses it for the house's side of the call, so the house
+//     can't dodge a lost call by keeping a bot quiet. With no house-run seat on just one side, the round is void, and the silent seats are
+//     there on chain for all to see. Both silent is void too. A seat is house-run because the house says so: a seat it holds and calls a
+//     player's isn't caught by this. See docs/DICE-PROOF.md.
+export circuit finish(id: RoundId): [] {
+  const i = disclose(id);
+  const r = roundOf(i);
+  assert(r.phase == Phase.called, "no call to finish");
+  const known = totals.lookup(i).read();
+  const pending = (r.dealt - answered.lookup(i).read()) as Uint<8>;
+  if (known >= r.bidCount) close(i, r, Phase.finished, Verdict.holds, Why.counted);
+  else if (known + pending * 5 < r.bidCount) close(i, r, Phase.finished, Verdict.falls, Why.counted);
+  else {
+    assert(blockTimeGte(r.answerBy), "cups can still answer");
+    const bidderIn = answers.member(cupAt(i, r.bidder));
+    const callerIn = answers.member(cupAt(i, r.caller));
+    if (!bidderIn && !callerIn) close(i, r, Phase.voided, Verdict.voided, Why.bothSilent);
+    else if (!bidderIn) close(i, r, Phase.finished, Verdict.falls, Why.bidderSilent);
+    else if (!callerIn) close(i, r, Phase.finished, Verdict.holds, Why.callerSilent);
+    else {
+      const houseQuiet = houseAnswered.lookup(i).read() != r.houseSeats;
+      const bidderHouse = houseRun.member(cupAt(i, r.bidder));
+      const callerHouse = houseRun.member(cupAt(i, r.caller));
+      if (houseQuiet && bidderHouse && !callerHouse) close(i, r, Phase.finished, Verdict.falls, Why.houseSeatSilent);
+      else if (houseQuiet && callerHouse && !bidderHouse) close(i, r, Phase.finished, Verdict.holds, Why.houseSeatSilent);
+      else close(i, r, Phase.voided, Verdict.voided, Why.thirdSilent);
+    }
+  }
+}

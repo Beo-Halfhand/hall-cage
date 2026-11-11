@@ -1,0 +1,41 @@
+{
+ "spike": "2026-11-02",
+ "cages": [
+  {
+   "address": "3e531a27e5ef2a7ec606188183befc4f3a92990ca72bf67f35891c70ba3acb5a",
+   "txHash": "35d00248aaf3395b5cdfed75f881231f34ccff8ad713e51e0380579ec4f7799d",
+   "escapeSecs": 300,
+   "judgeDelay": 600,
+   "maxRakeStar": "0",
+   "roundCapStar": "756000000",
+   "clockSlack": 300,
+   "seats": 6,
+   "network": "preprod",
+   "deployedAt": "2026-11-02T23:03:38.043Z"
+  },
+  {
+   "address": "b38a8d356f156cda25cbad7c5edd991ec9763f68d2e428f83e17207f91831e44",
+   "txHash": "e49d2849e64b5289b404bc937b8ebfb4f57de36af69ddc20dcc4dbbe2161c079",
+   "escapeSecs": 900,
+   "judgeDelay": 900,
+   "maxRakeStar": "0",
+   "roundCapStar": "756000000",
+   "clockSlack": 300,
+   "seats": 6,
+   "network": "preprod",
+   "deployedAt": "2026-11-02T23:34:28.543Z"
+  },
+  {
+   "address": "802bf6bb1759ced14f3ffd39dcb56bc6e4051ff09bea1194f9b16967fcfe5bf6",
+   "txHash": "e56a58dfae3376b8765efb9fe98eac1c1a79240227c314b034deaa44579fd37d",
+   "escapeSecs": 1800,
+   "judgeDelay": 1800,
+   "maxRakeStar": "0",
+   "roundCapStar": "1000000000",
+   "clockSlack": 300,
+   "seats": 6,
+   "network": "preprod",
+   "deployedAt": "2026-11-03T15:13:05.789Z"
+  }
+ ]
+}
