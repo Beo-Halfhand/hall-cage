@@ -25,7 +25,7 @@ The money side of the Hall, and the dice proof. Two Compact contracts, deployed 
 ```
  browser / agent ──HTTP──▶ the-hall (Cloudflare Worker, one Durable Object per table)
        │                        │ deals, seals the deck or dice, keeps the round's record
-       │ wallet (Lace)          │ /judge/ routes (token)            /judge/dice-proof (own token)
+       │ wallet (1AM)           │ /judge/ routes (token)            /judge/dice-proof (own token)
        ▼                        ▼                                    ▼
  Midnight Preprod ◀──tx── judge service (scripts/judge.mjs)    dice-house (scripts/dice-house.mjs)
    sealed-cage (v4b)          settles rounds, seats players     posts the house's side of a proof table
