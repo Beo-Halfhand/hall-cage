@@ -62,6 +62,16 @@ importers:
       ws:
         specifier: 8.21.0
         version: 8.21.0
+    devDependencies:
+      '@midnight-ntwrk/zkir-v2':
+        specifier: 2.2.0
+        version: 2.2.0
+
+  contracts:
+    dependencies:
+      '@midnight-ntwrk/compact-runtime':
+        specifier: 0.16.0
+        version: 0.16.0
 
   packages/cage-l8:
     dependencies:
@@ -187,6 +197,9 @@ packages:
   '@midnight-ntwrk/testkit-js@5.0.0':
     resolution: {integrity: sha512-5ys7weIJIL+kJc2SrOV1WzkgRJJ36VT8CZbxKkMuQ2OKJqUxpQkSFnRjgDH9T4Gp5+S07aswot0NRD7piPG04A==}
     engines: {node: '>=22.12'}
+
+  '@midnight-ntwrk/zkir-v2@2.2.0':
+    resolution: {integrity: sha512-UMVV5qkggfiw/5/4Lha3N5ImypucBFKL9me7xiqHwvyaE9N3SRJhc/Owbm7c5QkyrG8LoKslos1MNHm0Z34cLw==}
 
   '@midnightntwrk/dapp-connector-api@4.1.0':
     resolution: {integrity: sha512-Wzfg4FozTOCtGaOVZ8L8HHPWrN5WQHvJGm+ozbN3rkJuDOslmuDCpa1LCntJs1JLYu/FmF3hLfzJ9wEQJ155wQ==}
@@ -1746,6 +1759,8 @@ snapshots:
       - supports-color
       - tar-stream
       - utf-8-validate
+
+  '@midnight-ntwrk/zkir-v2@2.2.0': {}
 
   '@midnightntwrk/dapp-connector-api@4.1.0': {}
 

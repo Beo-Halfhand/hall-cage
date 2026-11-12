@@ -1,0 +1,10 @@
+{
+  "name": "hall-cage-contracts",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "description": "Where compact compile writes (contracts/managed/...). The 0.31.1 builds check for compact-runtime 0.16.0, so code compiled here resolves that version, while the scripts at the root use 0.21.0 with Midnight.js 5.",
+  "dependencies": {
+    "@midnight-ntwrk/compact-runtime": "0.16.0"
+  }
+}

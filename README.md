@@ -2,27 +2,63 @@
 
 ## For judges
 
-The money side of the Hall. `contracts/sealed-cage.compact` is the **cage** (v4b, 11 circuits): players deposit tNIGHT, sit with a declared `atRisk`, and a judge key settles rounds by moving balances inside the contract. Every debit is matched by credits plus a capped rake, bounded by `roundCap` and each player's `atRisk`, with escape hatches per table and per seat. `contracts/dice-proof.compact` checks Cup & Claim dice on chain. `scripts/judge.mjs` is the judge service that runs the live Hall's tNIGHT tables (two sites, one process). `packages/cage-l8` calls the deployed pre-fork builds from Midnight.js 5 after the Ledger 9 upgrade. `contracts/legacy/cage3.compact` is the older cage #3, kept for the attack tests and old receipts.
+The money side of the Hall, and the dice proof. Two Compact contracts, deployed on Midnight Preprod and in use by the live site:
+
+- `contracts/sealed-cage.compact` is the **cage** (v4b, 11 circuits). Players deposit tNIGHT, sit with a declared `atRisk`, and a judge key settles rounds by moving balances inside the contract. Every debit is matched by credits plus a capped rake, bounded by `roundCap` and each player's `atRisk`, with escape hatches per table and per seat.
+- `contracts/dice-proof.compact` is the **dice proof** (8 circuits). Each player's own wallet seals their cup on chain. A shut cup's count is proven without showing the dice, the chain adds up the counts and gives the verdict, and no count is anyone's word.
+
+`scripts/judge.mjs` is the judge service that settles the live Hall's tNIGHT tables. `scripts/dice-house.mjs` posts the house's side of a proof table. `packages/cage-l8` holds the deployed builds' runtime. `contracts/legacy/cage3.compact` is the older cage #3, kept for the attack tests and old receipts.
 
 | | |
 |---|---|
-| **Live** | https://halfhand.app (the Hall: Sealed Hand and Cup & Claim; play chips for free, or tNIGHT with a Midnight wallet) |
-| **Network** | Midnight **Preprod**, Ledger 9 (Preprod was upgraded in place to Ledger 9 on 2026-11-09; the contracts below were deployed before that and run unchanged) |
+| **Live** | https://halfhand.app (Sealed Hand and Cup & Claim; play chips for free, or tNIGHT with a Midnight wallet) |
+| **Network** | Midnight **Preprod**, Ledger 9. Preprod was upgraded in place to Ledger 9 on 2026-11-09; both contracts were deployed before that and run unchanged |
 | **Cage contract (v4b, live)** | `3ac0427139f8008df29a7aec1476e7efaca05c69f8dd1a3968edd6cdbe5cd6e4` (deployed 2026-11-06) |
-| **Dice-proof contract** | `c2459aac56301d3714f5bbc313534046b39c79e666d38e7fbe57445bfe5321c9` (deployed 2026-11-05; proof tables are a staging feature, off on halfhand.app, where a shut cup's count is house-attested) |
-| **Compiler** | Compact `compactc` 0.31.1 for both contracts (`.compact-version` in hall-cage). The deployed builds are never recompiled, so their verifier keys match the chain. Off-chain tooling: Midnight.js 5, wallet SDK 2, ledger-v9, proof server 9 |
-| **Repos** | [the-hall](https://github.com/Beo-Halfhand/the-hall) (site and games) · [hall-cage](https://github.com/Beo-Halfhand/hall-cage) (contracts and judge) · [hall-agent](https://github.com/Beo-Halfhand/hall-agent) (bring your own agent) |
-| **License** | MIT (see `LICENSE`) |
+| **Dice proof contract (live)** | `c2459aac56301d3714f5bbc313534046b39c79e666d38e7fbe57445bfe5321c9` (deployed 2026-11-05; on at halfhand.app since 2026-11-11 for proof tables, which open through the Hall's API) |
+| **Receipts to check** | A proof round with every cup shut and each count checked on chain: https://halfhand.app/receipt/2008-1 · dice shown and checked on chain: https://halfhand.app/receipt/2008-2 · an ordinary tNIGHT round: https://halfhand.app/receipt/2005-15. Each has a "Check this round" button that rechecks it in your browser |
+| **Compiler** | Compact `compactc` 0.31.1 (`.compact-version`); language 0.23. Off chain: Midnight.js 5, wallet SDK 2, ledger-v9, proof server 9 |
+| **Repos** | [the-hall](https://github.com/Beo-Halfhand/the-hall) (site and games) · [hall-cage](https://github.com/Beo-Halfhand/hall-cage) (contracts, judge, dice-house) · [hall-agent](https://github.com/Beo-Halfhand/hall-agent) (bring your own agent) |
+| **License** | Apache-2.0 (`LICENSE`, `NOTICE`) |
 
-### How to run
+### How it fits together
+
+```
+ browser / agent ──HTTP──▶ the-hall (Cloudflare Worker, one Durable Object per table)
+       │                        │ deals, seals the deck or dice, keeps the round's record
+       │ wallet (Lace)          │ /judge/ routes (token)            /judge/dice-proof (own token)
+       ▼                        ▼                                    ▼
+ Midnight Preprod ◀──tx── judge service (scripts/judge.mjs)    dice-house (scripts/dice-house.mjs)
+   sealed-cage (v4b)          settles rounds, seats players     posts the house's side of a proof table
+   dice-proof                 under a player's permit           (house seed, bots' answers)
+       ▲
+       └── players' own wallets: deposit, withdraw, seal a cup, prove a count, show the dice
+```
+
+### Where Midnight is used
+
+| What | Where | On chain (public) | Private (never leaves the player's machine) |
+|---|---|---|---|
+| Deposits and withdrawals | `deposit`, `withdraw`, `rescue` in the cage | tNIGHT moves on the **unshielded** ledger (`receiveUnshielded` / `sendUnshielded` of `nativeToken()`); each balance is kept in contract state under `H(player key)`, and the payout address is fixed at the first deposit | The cage key: the `secretKey()` witness. Only its hash, `persistentHash("sealed-cage:player:v0", sk)`, is on chain |
+| Seats and settles | `sit`, `stand`, `settleBatch`, `seatByJudge`, `release` | Who sits where, what each seat can still lose (`risks`), the round counter, permits | Nothing: a settle names hashed ids only |
+| Fees | every transaction | Paid in **DUST**, generated by NIGHT registered for it (the judge's and dice-house's wallets) | |
+| Dice | `commitCup`, `proveCount`, `showCup`, `finish` in dice-proof | The seal of each cup, each answer (a count, or the dice when shown), the total and the verdict | Each cup's seed: the `cupSeed()` witness. A shut cup proves its count from it without showing any die |
+| Rotation and locks | `proposeJudge` / `acceptJudge`; the deploy | A judge change waits out a timelock; both contracts were deployed with a maintenance authority nobody can use (`scripts/deploy-locked.mjs`) | |
+
+### How to run (from a fresh clone)
+
+Needs Node (tested with 26), pnpm (`corepack enable`), and the Compact compiler 0.31.1 (`compact update 0.31.1`).
 
 ```sh
-npm ci                 # pnpm workspace (packages/cage-l8)
-npm run compile        # cage v4b -> contracts/managed/sealed-cage   (Compact 0.31.1)
-npm run compile:dice   # dice-proof -> contracts/managed/dice-proof
-npm test               # contract rules, attacks, judge, settle wire format
+pnpm install --frozen-lockfile
+npm run compile:all    # cage v4b (11 circuits), dice-proof (8 circuits), cage #3 (--skip-zk)
+npm test               # contract rules, attacks, the zkir checker, dice proof, judge, settle wire format
 ```
-To talk to the live contracts, `packages/cage-l8/sealed-cage` and `packages/cage-l8/dice-proof` have to be the deployed 0.31.1 builds (copied from `contracts/managed/...` after a 0.31.1 compile; they are git-ignored because of their size). `zkir.test.mjs`, `dice-proof.test.mjs` and `lock.test.mjs` also need `@midnight-ntwrk/zkir-v2` and the Midnight.js 4 `./ledger` export, so they fail on a plain Midnight.js 5 install. Running a judge needs a funded Preprod wallet and a proof server: see "The judge service" below.
+
+Checked from a fresh clone on 2026-11-12 (Node 26, Compact 0.31.1): the cage compiles in about 18 s and dice-proof in about 13 s, and **`npm test` passes 381 of 381 in about a minute**. The fresh compile's verifier keys are byte for byte the ones in the deployed builds, so what you compile is what runs on chain.
+
+The tests run the real compiled circuits in the Compact simulator, with no network: `cage.test.mjs` and `attacks.test.mjs` for the cage's rules, `zkir.test.mjs` for the circuits through the zkir checker, `dice-proof.test.mjs` for whole proof rounds (including a cheating build that must be refused), and `wire.test.mjs` for the judge's loop against the real circuits. `npm run test:l8` is the one Ledger 8 era test (the locked deploy); it needs Midnight.js 4 and is kept for the record.
+
+`contracts/package.json` pins compact-runtime 0.16.0 for everything `compact compile` writes, because the 0.31.1 builds check for that version, while the scripts at the root use 0.21.0 with Midnight.js 5. Talking to the live contracts also needs the deployed builds copied to `packages/cage-l8/sealed-cage` and `packages/cage-l8/dice-proof`, plus a funded Preprod wallet and a proof server: see "The judge service" below.
 
 ---
 
@@ -32,7 +68,7 @@ A deposit bank ("cage") for Sealed Hand tables on Midnight **preprod**, test NIG
 
 Players deposit tNIGHT once, sit at a table with a declared exposure (`atRisk`), and a judge key settles each round by moving balances inside the contract. NIGHT only moves on `deposit`, `withdraw` and `rescue`; a settle moves no NIGHT. No circuit lets the judge or the deployer take anyone's balance: a settle can only debit a seated player, up to `roundCap` per round and up to that player's remaining `atRisk` in total, and every debit must be matched by credits to other seated players plus a capped rake.
 
-**Status:** v0 prototype. Compact 0.31.1 (`.compact-version`), 11 circuits (v4b: the 14 of v4 didn't fit one preprod transaction; `scripts/measure-deploy.mjs` shows why). Not audited. Not for real funds.  the preprod spike is logged in BUILD-LOG.md once it has run.
+**Status:** v0 prototype. Compact 0.31.1 (`.compact-version`), 11 circuits (v4b: the 14 of v4 didn't fit one preprod transaction; `scripts/measure-deploy.mjs` shows why). Not audited. Not for real funds. The preprod spike is logged in BUILD-LOG.md.
 
 ## The rules
 
@@ -64,8 +100,9 @@ Players deposit tNIGHT once, sit at a table with a declared exposure (`atRisk`),
 
 ## Build and test
 ```bash
-npm ci && npm run compile && npm test
+pnpm install --frozen-lockfile && npm run compile:all && npm test
 ```
+See "How to run" above for what passing looks like.
 
 ## Preprod spike (self-funded, own node and proof server)
 Endpoints come from the shell or an env file, as in sworn-escrow (`scripts/endpoints.mjs`); nothing is printed. Each wallet is a file set under `.wallets/` (seed, saved state, cage key; mode 600, gitignored).
@@ -114,4 +151,4 @@ Nothing secret belongs in this repo. Seeds, wallet state and cage keys live in `
 The transaction path and the keyless-pot idea come from [sworn-escrow](https://github.com/Beo-Halfhand/sworn-escrow). Game rules: Sealed Hand.
 
 ## License
-MIT
+Apache-2.0: see `LICENSE` and `NOTICE`. Commits before 2026-11-12 were published under the MIT License.

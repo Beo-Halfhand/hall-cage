@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
-import { createCircuitContext, createConstructorContext, proofDataIntoSerializedPreimage, QueryContext, CostModel, sampleContractAddress } from '@midnight-ntwrk/compact-runtime';
+import { createCircuitContext, createConstructorContext, proofDataIntoSerializedPreimage, QueryContext, CostModel, sampleContractAddress } from 'cage-l8/runtime';
 import * as zkir from '@midnight-ntwrk/zkir-v2';
 import * as J from '../scripts/dice-fair.mjs';
 
